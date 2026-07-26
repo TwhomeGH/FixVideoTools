@@ -1,0 +1,594 @@
+param(
+    [Parameter(Mandatory=$true, Position=0)]
+    [string]$InputFile,
+
+    [Parameter(Position=1)]
+    [string]$OutputFile,
+
+    [string]$SplitTime,
+    [string]$OutputDir,
+    [switch]$Force,
+    [switch]$KeepTemp,
+    [switch]$SkipVerify,
+    [switch]$NoConcat
+)
+
+function Write-Step {
+    param([string]$Msg, [string]$Color = "Cyan")
+    Write-Host ">>> $Msg" -ForegroundColor $Color
+}
+
+function Write-Info {
+    param([string]$Msg)
+    Write-Host "  $Msg" -ForegroundColor DarkCyan
+}
+
+function Write-Ok {
+    param([string]$Msg)
+    Write-Host "  $Msg" -ForegroundColor Green
+}
+
+function Write-Warn {
+    param([string]$Msg)
+    Write-Host "  $Msg" -ForegroundColor Yellow
+}
+
+function Write-Err {
+    param([string]$Msg)
+    Write-Host "  $Msg" -ForegroundColor Red
+}
+
+function Test-FFmpeg {
+    $ver = ffmpeg -version 2>&1 | Select-Object -First 1
+    if (-not $ver) {
+        Write-Err "ERROR: ffmpeg not found. Install from https://ffmpeg.org/"
+        exit 1
+    }
+    Write-Step "ffmpeg: $ver" DarkCyan
+}
+
+function Get-VideoInfo {
+    param([string]$File)
+    $json = ffprobe -v quiet -print_format json -show_format -show_streams $File 2>$null | ConvertFrom-Json
+    $v = $json.streams | Where-Object { $_.codec_type -eq "video" } | Select-Object -First 1
+    $a = $json.streams | Where-Object { $_.codec_type -eq "audio" } | Select-Object -First 1
+    $fmt = $json.format
+    return @{ Video = $v; Audio = $a; Format = $fmt }
+}
+
+function Format-Time {
+    param([double]$Seconds)
+    $ts = [timespan]::FromSeconds($Seconds)
+    return "$($ts.Hours.ToString('00')):$($ts.Minutes.ToString('00')):$($ts.Seconds.ToString('00'))"
+}
+
+function Get-PtsDeltas {
+    param([string]$File, [int]$MaxSamples = 2000)
+    $pts = ffprobe -v quiet -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 $File 2>$null
+    if (-not $pts -or $pts.Count -lt 10) { return $null }
+
+    $total = $pts.Count
+    $step = [math]::Max(1, [math]::Floor($total / $MaxSamples))
+    $window = [math]::Max(1, [math]::Floor($step / 2))
+
+    $result = @()
+    for ($i = $step; $i -lt $total; $i += $step) {
+        $delta = [double]$pts[$i] - [double]$pts[$i - $window]
+        $avgDelta = $delta / $window
+        $result += @{
+            Frame = $i
+            Pts = [double]$pts[$i]
+            Delta = $avgDelta
+        }
+    }
+    return $result
+}
+
+function Detect-BreakPoint {
+    param([string]$File)
+
+    Write-Step "Scanning PTS deltas for break point..." Yellow
+    $deltas = Get-PtsDeltas $File -MaxSamples 1000
+    if (-not $deltas -or $deltas.Count -lt 30) {
+        Write-Err "  Cannot analyze PTS: too few frames"
+        return $null
+    }
+
+    $count = $deltas.Count
+    $baselineCount = [math]::Max(15, [math]::Floor($count * 0.2))
+    $baseline = ($deltas[0..($baselineCount-1)] | ForEach-Object { $_.Delta } | Measure-Object -Average).Average
+
+    Write-Info "Baseline delta: $([math]::Round($baseline, 5))s  (~$([math]::Round(1/$baseline, 1)) fps)"
+
+    $windowSize = [math]::Max(5, [math]::Floor($count * 0.03))
+    $breakFound = $null
+
+    for ($i = $baselineCount; $i -lt $count - $windowSize; $i++) {
+        $window = $deltas[$i..($i+$windowSize-1)] | ForEach-Object { $_.Delta }
+        $avg = ($window | Measure-Object -Average).Average
+        $ratio = $avg / $baseline
+
+        if ($avg -gt 0 -and $ratio -lt 0.5) {
+            $breakFrame = $deltas[$i].Frame
+            $breakPts = $deltas[$i].Pts
+            $breakFound = @{
+                Frame = $breakFrame
+                PtsTime = $breakPts
+                DeltaAvg = $avg
+                Ratio = $ratio
+            }
+            Write-Info "Break detected at frame ~$breakFrame, PTS=$([math]::Round($breakPts, 1))s"
+            Write-Info "  Delta dropped to $([math]::Round($ratio*100, 1))% of baseline ($([math]::Round(1/$avg, 1)) fps)"
+            break
+        }
+    }
+
+    if (-not $breakFound) {
+        Write-Step "No clear break point detected" DarkCyan
+        return $null
+    }
+
+    return $breakFound
+}
+
+function Cut-Part1 {
+    param([string]$File, [double]$Duration, [string]$OutPath)
+
+    Write-Step "Cutting Part1 (0 ~ $([math]::Round($Duration, 0))s = $($(Format-Time $Duration)))" Green
+    $tempPath = [System.IO.Path]::GetTempPath()
+    $tempPart1 = Join-Path $tempPath "ptsspike_$([System.IO.Path]::GetRandomFileName()).mp4"
+
+    # Use audio-first stream copy for accurate cut
+    ffmpeg -copyts -i $File -map 0:a -map 0:v -c copy -to $Duration -y $tempPart1 2>&1 | ForEach-Object {
+        if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+            Write-Progress -Activity "Cutting Part1" -Status $matches[1]
+        }
+    }
+    Write-Progress -Activity "Cutting Part1" -Completed
+
+    if (-not (Test-Path $tempPart1)) {
+        Write-Err "ERROR: Part1 cut failed"
+        return $null
+    }
+
+    # Remux to restore video-first stream order
+    ffmpeg -i $tempPart1 -map 0:1 -map 0:0 -c copy -y $OutPath 2>&1 | ForEach-Object {
+        if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+            Write-Progress -Activity "Remuxing Part1" -Status $matches[1]
+        }
+    }
+    Write-Progress -Activity "Remuxing Part1" -Completed
+
+    Remove-Item $tempPart1 -Force -ErrorAction SilentlyContinue
+
+    if (Test-Path $OutPath) {
+        Write-Ok "  Part1 written: $OutPath"
+        return Get-VideoInfo $OutPath
+    }
+    return $null
+}
+
+function Get-FirstPts {
+    param([string]$File, [string]$StreamSpec)
+    $pts = ffprobe -v quiet -select_streams $StreamSpec -show_entries packet=pts_time -of csv=p=0 $File 2>$null | Select-Object -First 1
+    if ($pts) { return [double]$pts }
+    return $null
+}
+
+function Cut-Part2 {
+    param([string]$File, [double]$StartTime, [string]$OutPath)
+
+    Write-Step "Cutting Part2 ($(Format-Time $StartTime) ~ end)" Green
+
+    $tmpDir = [System.IO.Path]::GetTempPath()
+    $seekBack = [math]::Max(30, $StartTime * 0.01)
+
+    # Step 1/3: Cut video stream at StartTime
+    $tempVideo = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).mp4"
+    Write-Info "  Step 1/3: Cutting video at PTS $StartTime..."
+    ffmpeg -ss ($StartTime - $seekBack) -copyts -i $File -map 0:v -c copy -ss $StartTime -y $tempVideo 2>&1 | ForEach-Object {
+        if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+            Write-Progress -Activity "Cutting video" -Status $matches[1]
+        }
+    }
+    Write-Progress -Activity "Cutting video" -Completed
+    if (-not (Test-Path $tempVideo)) { Write-Err "ERROR: Video cut failed"; return $null }
+
+    # Get actual first video PTS (original PTS preserved by -copyts)
+    $vFirstOrigPts = Get-FirstPts $tempVideo "v:0"
+    if (-not $vFirstOrigPts) { Write-Err "ERROR: Cannot read video PTS"; Remove-Item $tempVideo -Force; return $null }
+    Write-Info ("  First video frame at original PTS {0:f4}s" -f $vFirstOrigPts)
+
+    # Step 2/3: Cut audio stream at the SAME original PTS as first video frame
+    $tempAudio = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).mp4"
+    Write-Info ("  Step 2/3: Cutting audio at same PTS {0:f4}s..." -f $vFirstOrigPts)
+    ffmpeg -ss ($StartTime - $seekBack) -copyts -i $File -map 0:a -c copy -ss $vFirstOrigPts -y $tempAudio 2>&1 | ForEach-Object {
+        if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+            Write-Progress -Activity "Cutting audio" -Status $matches[1]
+        }
+    }
+    Write-Progress -Activity "Cutting audio" -Completed
+    if (-not (Test-Path $tempAudio)) { Write-Err "ERROR: Audio cut failed"; Remove-Item $tempVideo -Force; return $null }
+
+    # Step 3/3: Combine video + audio (PTS auto-normalizes on mux)
+    Write-Info "  Step 3/3: Combining..."
+    ffmpeg -i $tempVideo -i $tempAudio -c copy -y $OutPath 2>&1 | ForEach-Object {
+        if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+            Write-Progress -Activity "Combining" -Status $matches[1]
+        }
+    }
+    Write-Progress -Activity "Combining" -Completed
+    Remove-Item $tempVideo, $tempAudio -Force -ErrorAction SilentlyContinue
+
+    if (Test-Path $OutPath) {
+        Write-Ok "  Part2 written: $OutPath"
+        return Get-VideoInfo $OutPath
+    }
+    return $null
+}
+
+function Fix-Part2Pts {
+    param([string]$InputFile, [string]$OutputFile, [double]$PtsOffset)
+
+    $info = Get-VideoInfo $InputFile
+    $v = $info.Video
+    $a = $info.Audio
+
+    if (-not $v -or -not $a) {
+        Write-Err "ERROR: Part2 missing video or audio stream"
+        return $null
+    }
+
+    $vDur = [double]$v.duration
+    $aDur = [double]$a.duration
+    $frames = try { [double]$v.nb_frames } catch { 0 }
+
+    Write-Step "Part2 analysis:" Yellow
+    Write-Info "  Video PTS duration: $([math]::Round($vDur, 1))s"
+    Write-Info "  Audio duration: $([math]::Round($aDur, 1))s"
+    Write-Info "  Frames: $frames"
+    Write-Info "  PTS offset for concat: +$([math]::Round($PtsOffset, 1))s"
+
+    if ($vDur -le 0) {
+        Write-Err "ERROR: Part2 video duration invalid"
+        return $null
+    }
+
+    if ($aDur -gt $vDur + 2) {
+        $ratio = $aDur / $vDur
+        Write-Warn "  PTS compression detected: video=$([math]::Round($vDur,1))s vs audio=$([math]::Round($aDur,1))s"
+        Write-Info "  Correction ratio: $([math]::Round($ratio, 4))x"
+        Write-Info "  Target FPS: $([math]::Round($frames / $aDur, 4))  (was $([math]::Round($frames / $vDur, 4)))"
+
+        $deltas = Get-PtsDeltas $InputFile -MaxSamples 500
+        $erratic = $false
+        if ($deltas -and $deltas.Count -gt 20) {
+            $deltaVals = $deltas | ForEach-Object { $_.Delta }
+            $avg = ($deltaVals | Measure-Object -Average).Average
+            $min = ($deltaVals | Measure-Object -Minimum).Minimum
+            if ($avg -gt 0 -and $min -gt 0 -and $min / $avg -lt 0.1) {
+                $erratic = $true
+                Write-Warn "  PTS deltas are erratic (min/avg=$([math]::Round($min/$avg*100, 1))%) — will use CFR rebuild"
+            }
+        }
+
+        if ($erratic) {
+            $targetFps = [math]::Round($frames / $aDur, 4)
+
+            $tmpDir = [System.IO.Path]::GetTempPath()
+            $tmpVideo = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).h264"
+            Write-Step "  Step 1/2: Extracting raw H.264..." DarkYellow
+            ffmpeg -i $InputFile -c:v copy -bsf:v h264_mp4toannexb -f h264 -y $tmpVideo 2>&1 | ForEach-Object {
+                if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+                    Write-Progress -Activity "Extracting H.264" -Status $matches[1]
+                }
+            }
+            Write-Progress -Activity "Extracting H.264" -Completed
+
+            Write-Step "  Step 2/2: Remuxing at $targetFps fps CFR + offset..." DarkYellow
+            ffmpeg -r $targetFps -i $tmpVideo -i $InputFile -c copy -map 0:v -map 1:a -t $aDur -output_ts_offset $PtsOffset -video_track_timescale 90000 -movflags +faststart -y $OutputFile 2>&1 | ForEach-Object {
+                if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+                    Write-Progress -Activity "CFR remux + offset" -Status $matches[1]
+                }
+            }
+            Write-Progress -Activity "CFR remux + offset" -Completed
+            Remove-Item $tmpVideo -Force -ErrorAction SilentlyContinue
+
+        } else {
+            Write-Step "Applying PTS stretch + offset..." Green
+            ffmpeg -i $InputFile -c copy -bsf:v "setts=pts=PTS*$ratio" -map 0 -output_ts_offset $PtsOffset -video_track_timescale 90000 -y $OutputFile 2>&1 | ForEach-Object {
+                if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+                    Write-Progress -Activity "Stretching PTS" -Status $matches[1]
+                }
+            }
+            Write-Progress -Activity "Stretching PTS" -Completed
+        }
+    } elseif ($vDur -gt $aDur + 2) {
+        $ratio = $aDur / $vDur
+        Write-Warn "  Video PTS is longer than audio: ratio=$([math]::Round($ratio, 4))"
+        Write-Step "Applying PTS compress + offset..." Green
+        ffmpeg -i $InputFile -c copy -bsf:v "setts=pts=PTS*$ratio" -map 0 -output_ts_offset $PtsOffset -video_track_timescale 90000 -y $OutputFile 2>&1 | ForEach-Object {
+            if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+                Write-Progress -Activity "Compressing PTS" -Status $matches[1]
+            }
+        }
+        Write-Progress -Activity "Compressing PTS" -Completed
+    } else {
+        Write-Ok "  Part2 A/V durations already match within tolerance"
+        Write-Step "  Shifting PTS by +$([math]::Round($PtsOffset, 1))s for concat..." DarkYellow
+        ffmpeg -i $InputFile -c copy -map 0 -output_ts_offset $PtsOffset -video_track_timescale 90000 -y $OutputFile 2>&1 | ForEach-Object {
+            if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+                Write-Progress -Activity "Shifting PTS" -Status $matches[1]
+            }
+        }
+        Write-Progress -Activity "Shifting PTS" -Completed
+    }
+
+    if (Test-Path $OutputFile) {
+        Write-Ok "  Fixed Part2: $OutputFile"
+        return Get-VideoInfo $OutputFile
+    }
+    return $null
+}
+
+function Concat-Parts {
+    param([string]$Part1, [string]$Part2, [string]$OutputFile)
+
+    Write-Step "Concatenating Part1 + Fixed Part2..." Green
+
+    $tmpDir = [System.IO.Path]::GetTempPath()
+    $concatFile = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).txt"
+
+    # Use ffmpeg concat demuxer
+    @"
+file '$($Part1 -replace "'","'\\''")'
+file '$($Part2 -replace "'","'\\''")'
+"@ | Set-Content -Path $concatFile -Encoding ASCII
+
+    ffmpeg -f concat -safe 0 -i $concatFile -c copy -map 0 -movflags +faststart -y $OutputFile 2>&1 | ForEach-Object {
+        if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
+            Write-Progress -Activity "Concatenating" -Status $matches[1]
+        }
+    }
+    Write-Progress -Activity "Concatenating" -Completed
+
+    Remove-Item $concatFile -Force -ErrorAction SilentlyContinue
+
+    return (Test-Path $OutputFile)
+}
+
+
+# ====== MAIN ======
+Write-Host ("=" * 70) -ForegroundColor Cyan
+Write-Host "  PTS Spike Fix Tool v1.1" -ForegroundColor Cyan
+Write-Host "  Detects and repairs PTS anomalies causing FPS spikes" -ForegroundColor Cyan
+Write-Host ("=" * 70) -ForegroundColor Cyan
+Write-Host "  -NoConcat : output part1 + part2_fixed separately (skip merge)" -ForegroundColor DarkGray
+Write-Host "  -OutputDir PATH : output directory (default: same as input)" -ForegroundColor DarkGray
+Write-Host "  -SplitTime HH:MM:SS : manual split point" -ForegroundColor DarkGray
+
+# Validate input
+if (-not (Test-Path -LiteralPath $InputFile)) {
+    Write-Err "ERROR: Input file not found: $InputFile"
+    exit 1
+}
+
+Test-FFmpeg
+
+# Analyze input
+Write-Step "Analyzing: $InputFile" Yellow
+$inInfo = Get-VideoInfo $InputFile
+$inV = $inInfo.Video
+$inA = $inInfo.Audio
+
+if (-not $inV) {
+    Write-Err "ERROR: No video stream found"
+    exit 1
+}
+
+$inVDur = [double]$inV.duration
+$inADur = if ($inA) { [double]$inA.duration } else { 0 }
+$inFmtDur = if ($inInfo.Format) { [double]$inInfo.Format.duration } else { 0 }
+
+Write-Info "Video: $($inV.codec_name) $($inV.width)x$($inV.height), PTS=$([math]::Round($inVDur,1))s, frames=$($inV.nb_frames)"
+if ($inA) {
+    Write-Info "Audio: $($inA.codec_name), duration=$([math]::Round($inADur,1))s"
+    $diff = [math]::Abs($inVDur - $inADur)
+    if ($diff -gt 2) {
+        Write-Warn "  A/V duration diff: $([math]::Round($diff, 1))s (PTS compression suspected)"
+    }
+}
+
+# Determine split point
+$actualSplitTime = $null
+
+if ($SplitTime) {
+    # Parse manual split time
+    if ($SplitTime -match '^(\d+):(\d+):(\d+)$') {
+        $actualSplitTime = [double]$matches[1] * 3600 + [double]$matches[2] * 60 + [double]$matches[3]
+        Write-Step "Using manual split time: $SplitTime = $([math]::Round($actualSplitTime, 0))s" Cyan
+    } elseif ($SplitTime -match '^(\d+)$') {
+        $actualSplitTime = [double]$SplitTime
+        Write-Step "Using manual split time: $([math]::Round($actualSplitTime, 0))s" Cyan
+    } else {
+        Write-Err "ERROR: Invalid SplitTime format. Use HH:MM:SS or seconds."
+        exit 1
+    }
+} else {
+    # Auto-detect
+    Write-Step "Auto-detecting break point..." Yellow
+    $breakPt = Detect-BreakPoint $InputFile
+    if ($breakPt) {
+        $actualSplitTime = $breakPt.PtsTime
+        Write-Ok "  Auto-detected break at PTS=$([math]::Round($actualSplitTime, 1))s"
+    } else {
+        Write-Err "ERROR: No break point detected. Use -SplitTime to specify manually."
+        exit 1
+    }
+}
+
+# Validate split time
+if ($actualSplitTime -le 0 -or $actualSplitTime -ge $inVDur) {
+    Write-Err "ERROR: Split time outside video PTS range (0 ~ $([math]::Round($inVDur, 1))s)"
+    exit 1
+}
+
+# Determine output paths
+$inDir = Split-Path $InputFile -Parent
+$base = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
+$outDir = if ($OutputDir) { $OutputDir } else { $inDir }
+
+if ($NoConcat) {
+    $part1Output = Join-Path $outDir "${base}_part1.mp4"
+    $part2FixedOutput = Join-Path $outDir "${base}_part2_fixed.mp4"
+
+    if ((Test-Path $part1Output) -and -not $Force) {
+        Write-Err "ERROR: Part1 output exists: $part1Output (use -Force to overwrite)"
+        exit 1
+    }
+    if ((Test-Path $part2FixedOutput) -and -not $Force) {
+        Write-Err "ERROR: Part2 fixed output exists: $part2FixedOutput (use -Force to overwrite)"
+        exit 1
+    }
+} else {
+    if (-not $OutputFile) {
+        $OutputFile = Join-Path $outDir "${base}_fixed.mp4"
+    }
+    if ((Test-Path $OutputFile) -and -not $Force) {
+        Write-Err "ERROR: Output exists: $OutputFile (use -Force to overwrite)"
+        exit 1
+    }
+}
+
+# Prepare paths
+$tmpDir = [System.IO.Path]::GetTempPath()
+$part2RawPath = Join-Path $tmpDir "ptsspike_part2_$([System.IO.Path]::GetRandomFileName()).mp4"
+
+if ($NoConcat) {
+    $part1Path = $part1Output
+    $part2FixedPath = $part2FixedOutput
+} else {
+    $part1Path = Join-Path $tmpDir "ptsspike_part1_$([System.IO.Path]::GetRandomFileName()).mp4"
+    $part2FixedPath = Join-Path $tmpDir "ptsspike_part2fixed_$([System.IO.Path]::GetRandomFileName()).mp4"
+}
+
+try {
+    # Step 1: Cut Part1
+    Write-Host ""
+    Write-Host ("-" * 60)
+    Write-Step "PHASE 1: Cut Part1 (0 ~ $([math]::Round($actualSplitTime, 0))s)" Yellow
+    $part1Info = Cut-Part1 $InputFile $actualSplitTime $part1Path
+    if (-not $part1Info) { throw "Part1 cut failed" }
+
+    # Step 2: Cut Part2
+    Write-Host ""
+    Write-Host ("-" * 60)
+    Write-Step "PHASE 2: Cut Part2 (remainder)" Yellow
+    $part2Info = Cut-Part2 $InputFile $actualSplitTime $part2RawPath
+    if (-not $part2Info) { throw "Part2 cut failed" }
+
+    # Step 3: Fix Part2 PTS
+    Write-Host ""
+    Write-Host ("-" * 60)
+    Write-Step "PHASE 3: Fix Part2 PTS" Yellow
+    $ptsOffset = if ($NoConcat) { 0 } else { [double]$part1Info.Video.duration }
+    $fixedInfo = Fix-Part2Pts $part2RawPath $part2FixedPath $ptsOffset
+    if (-not $fixedInfo) { throw "Part2 fix failed" }
+
+    if ($NoConcat) {
+        # Phase 4: done — parts are already at final paths
+        Write-Host ""
+        Write-Host ("-" * 60)
+        Write-Step "PHASE 4: Done — parts saved separately" Yellow
+        Write-Ok "  Part1: $part1Path"
+        Write-Ok "  Part2 fixed: $part2FixedPath"
+
+        # Verify each part
+        if (-not $SkipVerify) {
+            foreach ($label in @(@{Path=$part1Path; Name="Part1"}, @{Path=$part2FixedPath; Name="Part2 fixed"})) {
+                Write-Host ""
+                Write-Step "Verify $($label.Name)" Yellow
+                $vi = Get-VideoInfo $label.Path
+                $v = $vi.Video; $a = $vi.Audio
+                if ($v -and $a) {
+                    $vD = [double]$v.duration; $aD = [double]$a.duration; $d = [math]::Abs($vD - $aD)
+                    Write-Info "  Video PTS: $([math]::Round($vD,1))s  Audio: $([math]::Round($aD,1))s  Diff: $([math]::Round($d,2))s"
+                    if ($d -lt 2) { Write-Ok "  A/V sync OK" } else { Write-Warn "  A/V diff $([math]::Round($d,2))s" }
+                }
+            }
+        }
+
+        Write-Host ""
+        Write-Host ("=" * 70) -ForegroundColor Cyan
+        Write-Step "DONE — inspect each part separately before concatenating manually" Green
+        Write-Ok "  Part1:       $part1Path"
+        Write-Ok "  Part2 fixed: $part2FixedPath"
+        Write-Host ("=" * 70) -ForegroundColor Cyan
+    } else {
+        # Step 4: Concatenate
+        Write-Host ""
+        Write-Host ("-" * 60)
+        Write-Step "PHASE 4: Concatenate" Yellow
+        $ok = Concat-Parts $part1Path $part2FixedPath $OutputFile
+        if (-not $ok) { throw "Concatenation failed" }
+
+        # Step 5: Verify
+        if (-not $SkipVerify) {
+            Write-Host ""
+            Write-Host ("-" * 60)
+            Write-Step "PHASE 5: Verify Output" Yellow
+            $outInfo = Get-VideoInfo $OutputFile
+            $outV = $outInfo.Video
+            $outA = $outInfo.Audio
+
+            if ($outV -and $outA) {
+                $vDur = [double]$outV.duration
+                $aDur = [double]$outA.duration
+                $diff = [math]::Abs($vDur - $aDur)
+
+                Write-Info "  Video PTS duration: $([math]::Round($vDur, 1))s  ($(Format-Time $vDur))"
+                Write-Info "  Audio duration:     $([math]::Round($aDur, 1))s  ($(Format-Time $aDur))"
+
+                if ($diff -lt 2) {
+                    Write-Ok "  A/V sync: OK (diff=$([math]::Round($diff, 2))s)"
+                } else {
+                    Write-Warn "  A/V sync: diff=$([math]::Round($diff, 2))s"
+                }
+
+                $r_fps = try { [double]($outV.r_frame_rate -split '/')[0] / [double]($outV.r_frame_rate -split '/')[1] } catch { 0 }
+                Write-Info "  r_frame_rate: $($outV.r_frame_rate) (~$([math]::Round($r_fps, 2)) fps)"
+                Write-Info "  Container duration: $([math]::Round([double]$outInfo.Format.duration, 1))s"
+
+                if ($diff -lt 2) {
+                    Write-Step "VERIFIED: A/V sync OK" Green
+                } else {
+                    Write-Warn "WARNING: A/V duration mismatch persists"
+                }
+            }
+
+            $inSize = (Get-Item $InputFile).Length / 1GB
+            $outSize = (Get-Item $OutputFile).Length / 1GB
+            Write-Info "  Input size:  $([math]::Round($inSize, 3)) GB"
+            Write-Info "  Output size: $([math]::Round($outSize, 3)) GB"
+        }
+
+        Write-Host ""
+        Write-Host ("=" * 70) -ForegroundColor Cyan
+        Write-Step "SUCCESS! Output: $OutputFile" Green
+        Write-Host ("=" * 70) -ForegroundColor Cyan
+    }
+
+} catch {
+    Write-Err "ERROR: $_"
+    exit 1
+} finally {
+    if (-not $KeepTemp) {
+        Remove-Item $part2RawPath -Force -ErrorAction SilentlyContinue
+        if (-not $NoConcat) {
+            Remove-Item $part1Path -Force -ErrorAction SilentlyContinue
+            Remove-Item $part2FixedPath -Force -ErrorAction SilentlyContinue
+        }
+    } else {
+        Write-Step "Temp files kept" DarkGray
+    }
+}
