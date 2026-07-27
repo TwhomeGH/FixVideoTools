@@ -113,8 +113,19 @@ if ($actualFps -and $metaFps -gt 0 -and [math]::Abs($actualFps - $metaFps) -gt 1
 Write-Step "Duration: ${dur_m}min, Resolution: $res" Yellow
 Write-Step "SVT-AV1 preset $($svt_presets[$Preset]) CRF=$CRF" Yellow
 
-$ffargs = @(
-    "-i", "`"$encodeInput`""
+if ($actualFps) {
+    # -r before -i: tell ffmpeg input's actual frame rate (ignore corrupted container metadata)
+    $ffargs = @(
+        "-r", [string]$actualFps
+        "-i", "`"$encodeInput`""
+    )
+} else {
+    $ffargs = @(
+        "-i", "`"$encodeInput`""
+    )
+}
+
+$ffargs += @(
     "-map", "0:v"
     "-map", "0:a"
     "-c:v", "libsvtav1"
@@ -125,10 +136,6 @@ $ffargs = @(
     "-c:a", "aac", "-b:a", "128k"
     "-y", "`"$OutputFile`""
 )
-
-if ($actualFps) {
-    $ffargs += "-r", [string]$actualFps
-}
 
 $cmd = "ffmpeg $($ffargs -join ' ')"
 Write-Step "Command:" Yellow; Write-Host "  $cmd" -ForegroundColor DarkGray
