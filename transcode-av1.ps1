@@ -100,29 +100,33 @@ $a = $info.streams | Where-Object { $_.codec_type -eq "audio" } | Select-Object 
 $dur_m = [math]::Round([double]$info.format.duration / 60, 1)
 $res = if ($v) { "$($v.width)x$($v.height)" } else { "?" }
 
-# Detect corrupt r_frame_rate and use actual average
-$actualFps = $null
-if ($v.nb_frames -and $v.duration -and [double]$v.duration -gt 0) {
-    $actualFps = [math]::Round([double]$v.nb_frames / [double]$v.duration, 4)
+$vDur = if ($v.duration) { [double]$v.duration } else { 0 }
+$aDur = if ($a.duration) { [double]$a.duration } else { 0 }
+$hasPtsCompression = ($vDur -gt 0 -and $aDur -gt 0 -and [math]::Abs($vDur - $aDur) -gt 2)
+
+if ($hasPtsCompression) {
+    Write-Host "  !! PTS compression detected: video=$([math]::Round($vDur,1))s vs audio=$([math]::Round($aDur,1))s" -ForegroundColor Yellow
+    Write-Host "  !! Use fix-pts-spike.ps1 to repair PTS before transcoding" -ForegroundColor Yellow
 }
+
 $metaFps = if ($v.r_frame_rate -match '(\d+)/(\d+)') { [double]$matches[1] / [double]$matches[2] } else { 0 }
-if ($actualFps -and $metaFps -gt 0 -and [math]::Abs($actualFps - $metaFps) -gt 1) {
-    Write-Host "  !! r_frame_rate ($([math]::Round($metaFps,1))fps) != actual ($([math]::Round($actualFps,1))fps) — using -r $([math]::Round($actualFps,3))" -ForegroundColor Yellow
+$actualFps = if ($vDur -gt 0 -and $v.nb_frames) { [math]::Round([double]$v.nb_frames / $vDur, 4) } else { $null }
+
+$useVsyncVfr = $false
+if (-not $hasPtsCompression -and $metaFps -gt 0 -and $actualFps -and [math]::Abs($actualFps - $metaFps) -gt 1) {
+    Write-Host "  !! r_frame_rate ($([math]::Round($metaFps,1))fps) != actual ($([math]::Round($actualFps,1))fps) — using -vsync vfr to preserve original timing" -ForegroundColor Yellow
+    $useVsyncVfr = $true
 }
 
 Write-Step "Duration: ${dur_m}min, Resolution: $res" Yellow
 Write-Step "SVT-AV1 preset $($svt_presets[$Preset]) CRF=$CRF" Yellow
 
-if ($actualFps) {
-    # -r before -i: tell ffmpeg input's actual frame rate (ignore corrupted container metadata)
-    $ffargs = @(
-        "-r", [string]$actualFps
-        "-i", "`"$encodeInput`""
-    )
-} else {
-    $ffargs = @(
-        "-i", "`"$encodeInput`""
-    )
+$ffargs = @(
+    "-i", "`"$encodeInput`""
+)
+
+if ($useVsyncVfr) {
+    $ffargs = @("-vsync", "vfr") + $ffargs
 }
 
 $ffargs += @(

@@ -331,6 +331,169 @@ function Fix-Part2Pts {
     return $null
 }
 
+function Analyze-CompressionWindows {
+    param([string]$File, [int]$Windows = 20)
+
+    $info = Get-VideoInfo $File
+    $aDur = [double]$info.Audio.duration
+    if ($aDur -le 0) { return $null }
+
+    $pts = ffprobe -v quiet -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 $File 2>$null
+    if (-not $pts -or $pts.Count -lt $Windows * 5) { return $null }
+
+    $total = $pts.Count
+    $winSize = [math]::Floor($total / $Windows)
+    $results = @()
+
+    for ($i = 0; $i -lt $Windows; $i++) {
+        $s = $i * $winSize
+        $e = [math]::Min(($i + 1) * $winSize - 1, $total - 2)
+        if ($s -ge $e) { break }
+
+        $vStart = [double]$pts[$s]
+        $vEnd = [double]$pts[$e]
+        $vDur = $vEnd - $vStart
+        if ($vDur -le 0) { continue }
+
+        $pctStart = $s / $total
+        $pctEnd = ($e + 1) / $total
+        $aSegDur = ($pctEnd - $pctStart) * $aDur
+        $ratio = $aSegDur / $vDur
+
+        $results += @{
+            Window = $i
+            FrameS = $s
+            FrameE = $e
+            VStart = $vStart
+            VEnd   = $vEnd
+            VDur   = $vDur
+            Ratio  = $ratio
+        }
+    }
+    return $results
+}
+
+function Find-CompressionBreaks {
+    param($Windows, [double]$Threshold = 0.30)
+
+    if (-not $Windows -or $Windows.Count -lt 4) { return @() }
+
+    $ratios = $Windows | ForEach-Object { $_.Ratio }
+    $avg = ($ratios | Measure-Object -Average).Average
+    $breaks = @()
+
+    for ($i = 2; $i -lt $Windows.Count - 2; $i++) {
+        $localAvg = ($ratios[($i-2)..($i+2)] | Measure-Object -Average).Average
+        $deviation = [math]::Abs($ratios[$i] - $localAvg) / $localAvg
+        if ($deviation -gt $Threshold) {
+            $breakPts = [math]::Round(($Windows[$i].VStart + $Windows[$i].VEnd) / 2, 3)
+            $breaks += @{ PtsTime = $breakPts; Ratio = $ratios[$i]; Deviation = $deviation }
+        }
+    }
+    return $breaks
+}
+
+function Fix-Part2PtsMulti {
+    param([string]$InputFile, [string]$OutputFile, [double]$PtsOffset)
+
+    $tmpDir = [System.IO.Path]::GetTempPath()
+
+    # Analyze compression windows
+    $windows = Analyze-CompressionWindows $InputFile -Windows 20
+    if (-not $windows) { return Fix-Part2Pts $InputFile $OutputFile $PtsOffset }
+
+    $uniform = $true
+    if ($windows.Count -ge 4) {
+        $ratios = $windows | ForEach-Object { $_.Ratio }
+        $min = ($ratios | Measure-Object -Minimum).Minimum
+        $max = ($ratios | Measure-Object -Maximum).Maximum
+        $avg = ($ratios | Measure-Object -Average).Average
+        # If ratio varies by more than 25% from average, non-uniform
+        if ($avg -gt 0 -and ($max - $min) / $avg -gt 0.25) { $uniform = $false }
+    }
+
+    if ($uniform) {
+        Write-Info "  Compression ratio is uniform — using single-ratio fix"
+        return Fix-Part2Pts $InputFile $OutputFile $PtsOffset
+    }
+
+    Write-Warn "  Compression ratio varies across segment — using multi-segment fix"
+    $breaks = Find-CompressionBreaks $windows
+
+    # Build split points (in PTS, from the raw part2)
+    $splitPts = @(0)
+    foreach ($b in $breaks) {
+        $splitPts += $b.PtsTime
+    }
+    $info = Get-VideoInfo $InputFile
+    $splitPts += [double]$info.Video.duration
+    $splitPts = $splitPts | Sort-Object -Unique
+
+    Write-Info "  Splitting at $($splitPts.Count - 1) sub-segments..."
+
+    $segPaths = @()
+    $totalDur = 0
+    $accumOffset = $PtsOffset
+
+    for ($i = 0; $i -lt $splitPts.Count - 1; $i++) {
+        $segStart = $splitPts[$i]
+        $segEnd   = $splitPts[$i + 1]
+        $segDur   = $segEnd - $segStart
+        if ($segDur -lt 1) { continue }
+
+        $rawSeg = Join-Path $tmpDir "ptsspike_ms_$([System.IO.Path]::GetRandomFileName()).mp4"
+        $fixedSeg = Join-Path $tmpDir "ptsspike_mf_$([System.IO.Path]::GetRandomFileName()).mp4"
+
+        # Cut segment (stream copy, A/V together since part2_raw is already aligned)
+        Write-Info "    Segment $(($i+1)): PTS $([math]::Round($segStart,1))s ~ $([math]::Round($segEnd,1))s"
+        $ok = $false
+        if ($i -eq 0) {
+            # First segment: include from beginning
+            ffmpeg -copyts -i $InputFile -c copy -map 0 -to $segEnd -y $rawSeg 2>&1 | Out-Null
+            if (Test-Path $rawSeg) { $ok = $true }
+        } else {
+            ffmpeg -copyts -i $InputFile -c copy -map 0 -ss $segStart -to $segEnd -y $rawSeg 2>&1 | Out-Null
+            if (Test-Path $rawSeg) { $ok = $true }
+        }
+        if (-not $ok) { Write-Warn "      Segment $(($i+1)) cut failed, skipping"; continue }
+
+        # Fix segment with its own ratio + accumulated offset
+        $fixedInfo = Fix-Part2Pts $rawSeg $fixedSeg $accumOffset
+        Remove-Item $rawSeg -Force -ErrorAction SilentlyContinue
+
+        if (-not $fixedInfo) { Write-Warn "      Segment $(($i+1)) fix failed, skipping"; continue }
+
+        $segVDur = [double]$fixedInfo.Video.duration
+        $accumOffset += $segVDur
+        $totalDur += $segVDur
+        $segPaths += $fixedSeg
+    }
+
+    if ($segPaths.Count -eq 0) { throw "Multi-segment fix produced no valid segments" }
+    if ($segPaths.Count -eq 1) {
+        # Only one segment — just use it directly
+        Move-Item $segPaths[0] $OutputFile -Force
+        return Get-VideoInfo $OutputFile
+    }
+
+    # Concat all fixed segments
+    $concatList = Join-Path $tmpDir "ptsspike_concat_$([System.IO.Path]::GetRandomFileName()).txt"
+    $lines = $segPaths | ForEach-Object { "file '$_'" }
+    $lines -join "`n" | Set-Content -Path $concatList -Encoding ASCII
+
+    ffmpeg -f concat -safe 0 -i $concatList -c copy -map 0 -y $OutputFile 2>&1 | Out-Null
+    Remove-Item $concatList -Force -ErrorAction SilentlyContinue
+
+    # Cleanup segment files
+    foreach ($p in $segPaths) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+
+    if (Test-Path $OutputFile) {
+        Write-Ok "  Multi-segment fixed: $OutputFile"
+        return Get-VideoInfo $OutputFile
+    }
+    return $null
+}
+
 function Concat-Parts {
     param([string]$Part1, [string]$Part2, [string]$OutputFile)
 
@@ -487,12 +650,12 @@ try {
     $part2Info = Cut-Part2 $InputFile $actualSplitTime $part2RawPath
     if (-not $part2Info) { throw "Part2 cut failed" }
 
-    # Step 3: Fix Part2 PTS
+    # Step 3: Fix Part2 PTS (auto-detect uniform vs multi-segment)
     Write-Host ""
     Write-Host ("-" * 60)
     Write-Step "PHASE 3: Fix Part2 PTS" Yellow
     $ptsOffset = if ($NoConcat) { 0 } else { [double]$part1Info.Video.duration }
-    $fixedInfo = Fix-Part2Pts $part2RawPath $part2FixedPath $ptsOffset
+    $fixedInfo = Fix-Part2PtsMulti $part2RawPath $part2FixedPath $ptsOffset
     if (-not $fixedInfo) { throw "Part2 fix failed" }
 
     if ($NoConcat) {
