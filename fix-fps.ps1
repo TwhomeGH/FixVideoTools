@@ -108,6 +108,11 @@ if ($a) { Write-Step "Audio: $($a.codec_name), duration=$([math]::Round($aud_dur
 
 # Step 2: Diagnose
 $badFpsHeader = ($r_fps -gt 120 -or $r_fps -lt 1)
+$fpsMismatch = $false
+if ($real_fps -gt 0 -and $r_fps -gt 0) {
+    $ratio = $real_fps / $r_fps
+    $fpsMismatch = ($ratio -gt 1.5 -or $ratio -lt (1/1.5))
+}
 $ptsCompressed = $false
 $ptsCorrupted = $false
 $ptsRatio = 1.0
@@ -130,6 +135,9 @@ Write-Host ""
 if ($badFpsHeader) {
     Write-Host "  [ISSUE] r_frame_rate=$([math]::Round($r_fps,0)) fps (invalid stts metadata)" -ForegroundColor Red
 }
+if ($fpsMismatch) {
+    Write-Host "  [ISSUE] r_frame_rate=$($v.r_frame_rate) ($([math]::Round($r_fps,2)) fps) doesn't match real=$([math]::Round($real_fps,2)) fps (ratio=$([math]::Round($real_fps / $r_fps, 2))x)" -ForegroundColor Red
+}
 if ($ptsCorrupted) {
     Write-Host "  [ISSUE] PTS corrupted: ultra-short frame gaps detected (mixed normal/abnormal deltas)" -ForegroundColor Red
 }
@@ -137,7 +145,7 @@ if ($ptsCompressed) {
     Write-Host "  [ISSUE] PTS compressed: video=$([math]::Round($vid_dur,1))s vs target=$([math]::Round($Duration,1))s (ratio=$([math]::Round($ptsRatio,4)))" -ForegroundColor Red
 }
 
-if (-not $badFpsHeader -and -not $ptsCompressed -and -not $ptsCorrupted) {
+if (-not $badFpsHeader -and -not $fpsMismatch -and -not $ptsCompressed -and -not $ptsCorrupted) {
     Write-Host "  No issues detected." -ForegroundColor Green
     if ($aud_dur -gt $vid_dur + 2) {
         Write-Host "  Note: audio ($([math]::Round($aud_dur,1))s) is longer than video ($([math]::Round($vid_dur,1))s)" -ForegroundColor Yellow
@@ -153,6 +161,8 @@ if ($ptsCompressed) {
     Write-Host "  -> Will rebuild as CFR at $real_fps fps (discard corrupted PTS)" -ForegroundColor Yellow
 } elseif ($badFpsHeader) {
     Write-Host "  -> Will fix stts metadata (PTS values are correct)" -ForegroundColor Yellow
+} elseif ($fpsMismatch) {
+    Write-Host "  -> Will remux to correct r_frame_rate metadata" -ForegroundColor Yellow
 }
 
 # Step 3: Set output path
@@ -189,10 +199,15 @@ elseif ($Strategy -eq "mkv") {
     Write-Progress -Activity "Step 2/2" -Completed
     if (-not $KeepTemp) { Remove-Item $tmpMkv -Force -ErrorAction SilentlyContinue }
 }
-elseif ($Strategy -eq "cfr" -or $ptsCorrupted) {
+elseif ($Strategy -eq "cfr" -or $ptsCorrupted -or $fpsMismatch) {
     # CFR strategy: extract raw H.264 + AAC, remux at constant FPS
     # Discards all PTS/DTS (good for corrupted/intermittently wrong timestamps)
-    Write-Step "Strategy: CFR (constant frame rate rebuild, discards corrupted PTS)" Green
+    # Also used for fpsMismatch — raw stream remux with -r $real_fps fixes the header
+    if ($fpsMismatch -and -not $ptsCorrupted) {
+        Write-Step "Strategy: fix fps metadata (extract raw video + remux at $([math]::Round($real_fps,2)) fps)" Green
+    } else {
+        Write-Step "Strategy: CFR (constant frame rate rebuild, discards corrupted PTS)" Green
+    }
     $tmpDir = [System.IO.Path]::GetTempPath()
     $tmpVideo = Join-Path $tmpDir "fixfps_$([System.IO.Path]::GetRandomFileName()).h264"
     $tmpAudio = Join-Path $tmpDir "fixfps_$([System.IO.Path]::GetRandomFileName()).aac"
@@ -301,6 +316,7 @@ if (Test-Path -LiteralPath $OutputFile) {
     $outSize = (Get-Item $OutputFile).Length / 1GB
     Write-Step "Input:  $([math]::Round($inSize, 3)) GB" DarkCyan
     Write-Step "Output: $([math]::Round($outSize, 3)) GB" Green
+    Write-Step "Output: $OutputFile" Green
     Write-Step "DONE!" Green
 } else {
     Write-Host "ERROR: Output file was not created" -ForegroundColor Red

@@ -8,6 +8,9 @@
 
 ## 工具列表
 
+### `NetFix.py`
+用來壓縮轉碼用的工具 打包成AV1降低空間使用
+
 ### `analyze-pts.ps1`
 PTS 診斷工具。分析影片的 PTS 壓縮情形、A/V 時長差異，提供修復建議。
 
@@ -115,7 +118,7 @@ PTS 修復工具。將 TS（HLS/mpegts）檔 remux 為 MP4，修正 Twitch VOD �
 ---
 
 ### `fix-fps.ps1`
-FPS 修復工具。偵測並修復三種問題：r_frame_rate 損壞、PTS 壓縮、PTS 混亂。
+FPS 修復工具。偵測並修復四種問題：r_frame_rate 損壞、r_frame_rate 與實際 fps 不匹配、PTS 壓縮、PTS 混亂。
 
 ```
 .\fix-fps.ps1 -InputFile <路徑> [-OutputFile <路徑>] [-Strategy auto|cfr|genpts|mkv] [-Duration <秒數>] [-Force] [-KeepTemp]
@@ -129,6 +132,12 @@ FPS 修復工具。偵測並修復三種問題：r_frame_rate 損壞、PTS 壓�
 | `-Duration` | 目標影片時長（PTS 拉伸用） |
 | `-Force` | 覆蓋已存在的輸出 |
 | `-KeepTemp` | 保留暫存檔 |
+
+**偵測項目：**
+- `r_frame_rate > 120` 或 `< 1`：無效的 stts 元資料
+- `r_frame_rate` 與 `real_fps` 比值 > 1.5x 或 < 0.67x：頭部 fps 欄位與實際幀率不符（如 `r_frame_rate=20/1` 但實際 `58.58fps`）
+- PTS 壓縮：幀間隔異常密集（透過 `-Duration` 指定目標時長觸發）
+- PTS 混亂：正常 delta 與 <1ms 超短 delta 混合出現
 
 ---
 
