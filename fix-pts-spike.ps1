@@ -278,6 +278,124 @@ function Test-CfrSafe {
     return $safe
 }
 
+function Detect-FrameTimingBreak {
+    param([string]$File)
+
+    # Scans per-frame video PTS deltas from the END backward and finds the first
+    # frame where the delta is sharply smaller than the tail's delta. This marks a
+    # frame-timing-change boundary (memory #51): the compressed main body has tiny
+    # deltas (~0.004s) while an uncompressed tail region has normal deltas (~0.03s).
+    # Returns @{ Boundary; TailFrames; MainFrames; MainVptsEnd; TailDelta } or $null.
+    $vpts = ffprobe -v quiet -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 $File 2>$null
+    $nV = $vpts.Count
+    if ($nV -lt 2000) { return $null }
+
+    $step = 500
+    $tailDelta = ([double]$vpts[$nV-1] - [double]$vpts[$nV-1-$step]) / $step
+    if ($tailDelta -le 0) { return $null }
+
+    # Tail region is "normal" only if its per-frame delta is > 0.01 (i.e. <100fps).
+    if ($tailDelta -lt 0.01) { return $null }
+
+    $boundary = $nV
+    for ($k = $nV - 1 - $step; $k -ge $step; $k -= $step) {
+        $d = ([double]$vpts[$k] - [double]$vpts[$k - $step]) / $step
+        if ($d -lt $tailDelta * 0.3) { $boundary = $k + $step; break }
+    }
+
+    if ($boundary -ge $nV - 100) { return $null }  # no real break found
+
+    $tailFrames = $nV - $boundary
+    if ($tailFrames -lt 200 -or $tailFrames -gt $nV / 3) { return $null }  # tail too small/large to matter
+
+    $result = @{
+        Boundary = $boundary
+        MainFrames = $boundary
+        TailFrames = $tailFrames
+        MainVptsEnd = [double]$vpts[$boundary - 1]
+        TailVptsStart = [double]$vpts[$boundary]
+        TailDelta = $tailDelta
+    }
+    Write-Info ("  Frame-timing break at frame {0}: main={1} frames, tail={2} frames (delta {3:N5})" -f $boundary, $boundary, $tailFrames, $tailDelta)
+    return $result
+}
+
+function Fix-Part2Segmented {
+    param([string]$InputFile, [string]$OutputFile, [double]$PtsOffset, $Break)
+
+    # Segmented CFR fix: main body compressed (~constant fps), tail uncompressed
+    # (lower fps). Each segment gets its own CFR fps; audio is split at the
+    # corresponding audio time (tail audio = tail video PTS span since tail is
+    # uncompressed). Concatenate the two fixed segments.
+    $tmpDir = $script:WorkDir
+    $info = Get-VideoInfo $InputFile
+    $aDur = [double]$info.Audio.duration
+    $ap = ffprobe -v quiet -select_streams a:0 -show_entries packet=pts_time -of csv=p=0 $InputFile 2>$null
+    $aLast = [double]$ap[-1]
+
+    $mainFrames = $Break.MainFrames
+    $tailFrames = $Break.TailFrames
+    $mainVptsEnd = $Break.MainVptsEnd
+
+    # tail is uncompressed → its audio time = its video PTS span
+    $tailVptsStart = $Break.TailVptsStart
+    $tailAudio = [double]$ap[-1] - 0  # placeholder, recompute below
+    # actual tail video PTS span (from input)
+    $vpts = ffprobe -v quiet -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 $InputFile 2>$null
+    $tailAudio = [double]$vpts[-1] - $tailVptsStart
+    $mainAudio = $aLast - $tailAudio
+
+    if ($mainAudio -le 0 -or $tailAudio -le 0 -or $mainFrames -lt 100 -or $tailFrames -lt 50) {
+        Write-Warn "  Segment parameters invalid — falling back to single CFR"
+        return $null
+    }
+
+    $mainFps = $mainFrames / $mainAudio
+    $tailFps = $tailFrames / $tailAudio
+    Write-Info ("  MAIN: frames={0} audio={1:N2}s fps={2:N4}" -f $mainFrames, $mainAudio, $mainFps)
+    Write-Info ("  TAIL: frames={0} audio={1:N2}s fps={2:N4}" -f $tailFrames, $tailAudio, $tailFps)
+
+    # --- MAIN segment ---
+    $mainV = Join-Path $tmpDir "ptsspike_sg_$([System.IO.Path]::GetRandomFileName()).mp4"
+    $mainA = Join-Path $tmpDir "ptsspike_sa_$([System.IO.Path]::GetRandomFileName()).mp4"
+    $mainH = Join-Path $tmpDir "ptsspike_sh_$([System.IO.Path]::GetRandomFileName()).h264"
+    $mainOut = Join-Path $tmpDir "ptsspike_sm_$([System.IO.Path]::GetRandomFileName()).mp4"
+    Write-Step "  Segment MAIN: CFR @ $([math]::Round($mainFps,3)) fps..." Green
+    ffmpeg -copyts -i $InputFile -map 0:v -c copy -frames:v $mainFrames -y $mainV 2>&1 | Out-Null
+    ffmpeg -copyts -i $InputFile -map 0:a -c copy -to $mainAudio -y $mainA 2>&1 | Out-Null
+    ffmpeg -i $mainV -c:v copy -bsf:v h264_mp4toannexb -f h264 -y $mainH 2>&1 | Out-Null
+    ffmpeg -r $mainFps -i $mainH -i $mainA -c copy -map 0:v -map 1:a -output_ts_offset $PtsOffset -video_track_timescale 90000 -movflags +faststart -y $mainOut 2>&1 | Out-Null
+    Remove-Item $mainV, $mainA, $mainH -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path $mainOut)) { Write-Warn "  MAIN segment failed"; return $null }
+
+    # --- TAIL segment ---
+    $tailV = Join-Path $tmpDir "ptsspike_tv_$([System.IO.Path]::GetRandomFileName()).mp4"
+    $tailA = Join-Path $tmpDir "ptsspike_ta_$([System.IO.Path]::GetRandomFileName()).mp4"
+    $tailH = Join-Path $tmpDir "ptsspike_th_$([System.IO.Path]::GetRandomFileName()).h264"
+    $tailOut = Join-Path $tmpDir "ptsspike_tm_$([System.IO.Path]::GetRandomFileName()).mp4"
+    Write-Step "  Segment TAIL: CFR @ $([math]::Round($tailFps,3)) fps..." Green
+    ffmpeg -copyts -ss $mainVptsEnd -i $InputFile -map 0:v -c copy -frames:v $tailFrames -y $tailV 2>&1 | Out-Null
+    ffmpeg -ss $mainAudio -i $InputFile -map 0:a -c copy -y $tailA 2>&1 | Out-Null
+    ffmpeg -i $tailV -c:v copy -bsf:v h264_mp4toannexb -f h264 -y $tailH 2>&1 | Out-Null
+    $tailOffset = $PtsOffset + $mainAudio
+    ffmpeg -r $tailFps -i $tailH -i $tailA -c copy -map 0:v -map 1:a -output_ts_offset $tailOffset -video_track_timescale 90000 -movflags +faststart -y $tailOut 2>&1 | Out-Null
+    Remove-Item $tailV, $tailA, $tailH -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path $tailOut)) { Write-Warn "  TAIL segment failed"; Remove-Item $mainOut -Force; return $null }
+
+    # --- Concat ---
+    $list = Join-Path $tmpDir "ptsspike_sc_$([System.IO.Path]::GetRandomFileName()).txt"
+    $content = "file '$mainOut'`nfile '$tailOut'`n"
+    [System.IO.File]::WriteAllText($list, $content, (New-Object System.Text.UTF8Encoding($false)))
+    ffmpeg -f concat -safe 0 -i $list -c copy -map 0 -movflags +faststart -y $OutputFile 2>&1 | Out-Null
+    Remove-Item $list, $mainOut, $tailOut -Force -ErrorAction SilentlyContinue
+
+    if (Test-Path $OutputFile) {
+        Write-Ok "  Segmented fix done"
+        return Get-VideoInfo $OutputFile
+    }
+    return $null
+}
+
 function Fix-Part2Pts {
     param([string]$InputFile, [string]$OutputFile, [double]$PtsOffset)
 
@@ -338,7 +456,28 @@ function Fix-Part2Pts {
         }
 
         if ($erratic) {
-            $targetFps = [math]::Round($frames / $aDur, 4)
+            # Try segmented CFR first: main body compressed + uncompressed tail
+            # region (frame-timing-change). A single uniform CFR would speed up
+            # the tail content (e.g. 30fps tail forced to 50fps → 1.69x, jerky
+            # playback, A/V drift). Splitting preserves each region's true fps.
+            $break = Detect-FrameTimingBreak $InputFile
+            if ($break) {
+                Write-Warn "  Frame-timing change detected — using segmented CFR"
+                $segInfo = Fix-Part2Segmented $InputFile $OutputFile $PtsOffset $break
+                if ($segInfo) {
+                    return $segInfo
+                }
+                Write-Warn "  Segmented fix failed — falling back to single CFR"
+            }
+
+            # Use ACTUAL video packet count and ACTUAL audio last PTS for fps,
+            # not nb_frames/duration metadata (which can be off by many frames
+            # after Cut-Part2, causing cumulative A/V drift over hours).
+            $vPkt = & ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 $InputFile 2>&1
+            $aPts = ffprobe -v quiet -select_streams a:0 -show_entries packet=pts_time -of csv=p=0 $InputFile 2>$null
+            $aLastPts = if ($aPts -and $aPts.Count -gt 0) { [double]$aPts[-1] } else { $aDur }
+            $targetFps = if ($vPkt -and $aLastPts -gt 0) { $vPkt / $aLastPts } else { [math]::Round($frames / $aDur, 4) }
+            Write-Info ("  Actual packets={0} audioLast={1:N4}s → CFR fps={2:N6}" -f $vPkt, $aLastPts, $targetFps)
 
             $tmpDir = $script:WorkDir
             $tmpVideo = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).h264"
@@ -351,7 +490,7 @@ function Fix-Part2Pts {
             Write-Progress -Activity "Extracting H.264" -Completed
 
             Write-Step "  Step 2/2: Remuxing at $targetFps fps CFR + offset..." DarkYellow
-            ffmpeg -r $targetFps -i $tmpVideo -i $InputFile -c copy -map 0:v -map 1:a -t $aDur -output_ts_offset $PtsOffset -video_track_timescale 90000 -movflags +faststart -y $OutputFile 2>&1 | ForEach-Object {
+            ffmpeg -r $targetFps -i $tmpVideo -i $InputFile -c copy -map 0:v -map 1:a -t $aLastPts -output_ts_offset $PtsOffset -video_track_timescale 90000 -movflags +faststart -y $OutputFile 2>&1 | ForEach-Object {
                 if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
                     Write-Progress -Activity "CFR remux + offset" -Status $matches[1]
                 }
