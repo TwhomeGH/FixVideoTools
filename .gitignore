@@ -1,3 +1,6 @@
 *.mp4
 *.wav
+*.mkv
+*.mov
 *.pyc
+_tmp
