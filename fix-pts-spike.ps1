@@ -254,6 +254,30 @@ function Cut-Part2 {
     return $null
 }
 
+function Test-CfrSafe {
+    param([string]$File)
+
+    # CFR rebuild is safe when the video PTS timeline is STRONGLY compressed
+    # relative to audio (vDur much smaller than aDur) AND per-frame deltas are
+    # erratic. In that case the real frame rate is constant (frames/audio_dur)
+    # and only the PTS labels are broken — uniform re-timing via -r is correct.
+    #
+    # Genuine VFR sources keep video PTS ≈ audio duration (PTS reflects real
+    # time, only fps changes) — those must NOT go through CFR. The audio>>video
+    # guard here guarantees we never route a VFR source into CFR.
+    $info = Get-VideoInfo $File
+    $v = $info.Video
+    $a = $info.Audio
+    if (-not $v -or -not $a) { return $true }
+
+    $vDur = [double]$v.duration
+    $aDur = [double]$a.duration
+    $ratio = if ($aDur -gt 0) { $vDur / $aDur } else { 1 }
+    $safe = $ratio -lt 0.5
+    Write-Info ("  PTS/audio span ratio: {0:N2} {1}" -f $ratio, $(if ($safe) { "(CFR safe)" } else { "(not strongly compressed — skip CFR)" }))
+    return $safe
+}
+
 function Fix-Part2Pts {
     param([string]$InputFile, [string]$OutputFile, [double]$PtsOffset)
 
@@ -286,24 +310,31 @@ function Fix-Part2Pts {
         Write-Info "  Correction ratio: $([math]::Round($ratio, 4))x"
         Write-Info "  Target FPS: $([math]::Round($frames / $aDur, 4))  (was $([math]::Round($frames / $vDur, 4)))"
 
+        # Decide between CFR rebuild and setts stretch by looking at the actual
+        # video PTS delta uniformity — NOT by compression ratio. A file with
+        # uneven per-frame deltas (some regions ~1x, others ~4x) cannot be fixed
+        # with a single setts multiplier; that is exactly the "fast/slow jerky
+        # video" symptom. CFR rebuild re-times every frame uniformly and is safe
+        # when the PTS timeline is strongly compressed (real fps constant).
         $erratic = $false
-        if ($ratio -le 1.5) {
-            # Only for mild compression do we risk erratic deltas (CFR rebuild).
-            # For strong compression (audio >> video), the healthy audio IS the
-            # reference timeline — always use setts stretch to preserve VFR PTS.
-            # (CFR rebuild would destroy VFR timing — see 2026.6.10-3第五 trap.)
-            $deltas = Get-PtsDeltas $InputFile -MaxSamples 500
-            if ($deltas -and $deltas.Count -gt 20) {
-                $deltaVals = $deltas | ForEach-Object { $_.Delta }
-                $avg = ($deltaVals | Measure-Object -Average).Average
-                $min = ($deltaVals | Measure-Object -Minimum).Minimum
-                if ($avg -gt 0 -and $min -gt 0 -and $min / $avg -lt 0.1) {
-                    $erratic = $true
-                    Write-Warn "  PTS deltas are erratic (min/avg=$([math]::Round($min/$avg*100, 1))%) — will use CFR rebuild"
-                }
+        $deltas = Get-PtsDeltas $InputFile -MaxSamples 500
+        if ($deltas -and $deltas.Count -gt 20) {
+            $deltaVals = $deltas | ForEach-Object { $_.Delta }
+            $avg = ($deltaVals | Measure-Object -Average).Average
+            $min = ($deltaVals | Measure-Object -Minimum).Minimum
+            if ($avg -gt 0 -and $min -gt 0 -and $min / $avg -lt 0.25) {
+                $erratic = $true
+                Write-Warn "  PTS deltas are erratic (min/avg=$([math]::Round($min/$avg*100, 1))%) — considering CFR rebuild"
             }
-        } else {
-            Write-Info "  Strong compression (audio is the reference timeline) — using setts stretch"
+        }
+
+        if ($erratic) {
+            if (-not (Test-CfrSafe $InputFile)) {
+                Write-Warn "  Not strongly compressed — CFR would destroy timing, using setts stretch instead"
+                $erratic = $false
+            } else {
+                Write-Info "  Strongly compressed with uniform real fps — using CFR rebuild"
+            }
         }
 
         if ($erratic) {
@@ -441,9 +472,12 @@ function Fix-Part2PtsMulti {
 
     $tmpDir = $script:WorkDir
 
-    # KEY GUARD: if audio duration is much longer than video PTS, the audio stream
-    # is the healthy reference timeline (video PTS compressed). Splitting part2 by
-    # video PTS would truncate the healthy audio — always use single-ratio stretch.
+    # If audio >> video PTS, the audio is the healthy reference timeline. The
+    # question is whether the compression is uniform (single ratio works) or
+    # uneven (needs CFR or multi-segment). Defer to Fix-Part2Pts which inspects
+    # PTS delta uniformity — do NOT force single-ratio here.
+    # (Splitting part2 by video PTS would truncate the healthy audio, so the
+    # multi-segment path below is only valid when audio PTS matches video PTS.)
     $gInfo = Get-VideoInfo $InputFile
     $gV = $gInfo.Video
     $gA = $gInfo.Audio
@@ -452,7 +486,7 @@ function Fix-Part2PtsMulti {
         $gADur = [double]$gA.duration
         if ($gADur -gt $gVDur * 1.5) {
             Write-Warn "  Audio is the reference timeline (audio=$([math]::Round($gADur,1))s vs video PTS=$([math]::Round($gVDur,1))s)"
-            Write-Warn "  Using single-ratio stretch — splitting by video PTS would truncate the healthy audio"
+            Write-Warn "  Delegating to Fix-Part2Pts (uniform ratio → setts; erratic deltas → CFR)"
             return Fix-Part2Pts $InputFile $OutputFile $PtsOffset
         }
     }
