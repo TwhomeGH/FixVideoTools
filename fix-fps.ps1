@@ -241,8 +241,9 @@ else {
     if ($ptsCompressed) {
         Write-Step "Phase 1: Stretching PTS by $([math]::Round($ptsRatio,4))x (setts bsf, stream copy)..." Green
         $tmpStretched = Join-Path $tmpDir "fixfps_$([System.IO.Path]::GetRandomFileName()).mp4"
-        Write-Step "  Applying setts=pts=PTS*$ptsRatio to video stream..." DarkYellow
-        ffmpeg -i $InputFile -c copy -bsf:v "setts=pts=PTS*$ptsRatio" -map 0 -y $tmpStretched 2>&1 | ForEach-Object {
+        Write-Step "  Applying setts=pts=PTS*$ptsRatio:dts=DTS*$ptsRatio to video stream..." DarkYellow
+        # Stretch BOTH pts and dts so the MP4 stts table is written correctly.
+        ffmpeg -i $InputFile -c copy -bsf:v "setts=pts=PTS*${ptsRatio}:dts=DTS*${ptsRatio}" -map 0 -y $tmpStretched 2>&1 | ForEach-Object {
             if ($_ -match "time=(\d+:\d+:\d+\.\d+)") { Write-Progress -Activity "Stretching PTS" -Status $matches[1] }
         }
         Write-Progress -Activity "Stretching PTS" -Completed

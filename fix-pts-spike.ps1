@@ -119,27 +119,32 @@ function Detect-BreakPoint {
 
     Write-Info "Baseline delta: $([math]::Round($baseline, 5))s  (~$([math]::Round(1/$baseline, 1)) fps)"
 
-    $windowSize = [math]::Max(5, [math]::Floor($count * 0.03))
+    # Require a SUSTAINED drop: the first sample whose delta drops below 50% of
+    # baseline AND whose following samples stay low. Per-sample detection avoids
+    # the forward-window averaging that pulls the boundary earlier.
+    $minHold = [math]::Max(3, [math]::Floor($count * 0.01))
     $breakFound = $null
 
-    for ($i = $baselineCount; $i -lt $count - $windowSize; $i++) {
-        $window = $deltas[$i..($i+$windowSize-1)] | ForEach-Object { $_.Delta }
-        $avg = ($window | Measure-Object -Average).Average
-        $ratio = $avg / $baseline
+    for ($i = $baselineCount; $i -lt $count - $minHold; $i++) {
+        $ratio = $deltas[$i].Delta / $baseline
+        if ($ratio -ge 0.5) { continue }
 
-        if ($avg -gt 0 -and $ratio -lt 0.5) {
-            $breakFrame = $deltas[$i].Frame
-            $breakPts = $deltas[$i].Pts
-            $breakFound = @{
-                Frame = $breakFrame
-                PtsTime = $breakPts
-                DeltaAvg = $avg
-                Ratio = $ratio
-            }
-            Write-Info "Break detected at frame ~$breakFrame, PTS=$([math]::Round($breakPts, 1))s"
-            Write-Info "  Delta dropped to $([math]::Round($ratio*100, 1))% of baseline ($([math]::Round(1/$avg, 1)) fps)"
-            break
+        # confirm the next minHold samples also stay below 0.5
+        $sustained = $true
+        for ($j = $i + 1; $j -le $i + $minHold; $j++) {
+            if ($deltas[$j].Delta / $baseline -ge 0.5) { $sustained = $false; break }
         }
+        if (-not $sustained) { continue }
+
+        $breakFound = @{
+            Frame = $deltas[$i].Frame
+            PtsTime = $deltas[$i].Pts
+            DeltaAvg = $deltas[$i].Delta
+            Ratio = $ratio
+        }
+        Write-Info "Break detected at frame ~$($deltas[$i].Frame), PTS=$([math]::Round($deltas[$i].Pts, 1))s"
+        Write-Info "  Delta dropped to $([math]::Round($ratio*100, 1))% of baseline ($([math]::Round(1/$deltas[$i].Delta, 1)) fps)"
+        break
     }
 
     if (-not $breakFound) {
@@ -270,7 +275,6 @@ function Fix-Part2Pts {
     Write-Info "  Audio duration: $([math]::Round($aDur, 1))s"
     Write-Info "  Frames: $frames"
     Write-Info "  PTS offset for concat: +$([math]::Round($PtsOffset, 1))s"
-
     if ($vDur -le 0) {
         Write-Err "ERROR: Part2 video duration invalid"
         return $null
@@ -282,16 +286,24 @@ function Fix-Part2Pts {
         Write-Info "  Correction ratio: $([math]::Round($ratio, 4))x"
         Write-Info "  Target FPS: $([math]::Round($frames / $aDur, 4))  (was $([math]::Round($frames / $vDur, 4)))"
 
-        $deltas = Get-PtsDeltas $InputFile -MaxSamples 500
         $erratic = $false
-        if ($deltas -and $deltas.Count -gt 20) {
-            $deltaVals = $deltas | ForEach-Object { $_.Delta }
-            $avg = ($deltaVals | Measure-Object -Average).Average
-            $min = ($deltaVals | Measure-Object -Minimum).Minimum
-            if ($avg -gt 0 -and $min -gt 0 -and $min / $avg -lt 0.1) {
-                $erratic = $true
-                Write-Warn "  PTS deltas are erratic (min/avg=$([math]::Round($min/$avg*100, 1))%) — will use CFR rebuild"
+        if ($ratio -le 1.5) {
+            # Only for mild compression do we risk erratic deltas (CFR rebuild).
+            # For strong compression (audio >> video), the healthy audio IS the
+            # reference timeline — always use setts stretch to preserve VFR PTS.
+            # (CFR rebuild would destroy VFR timing — see 2026.6.10-3第五 trap.)
+            $deltas = Get-PtsDeltas $InputFile -MaxSamples 500
+            if ($deltas -and $deltas.Count -gt 20) {
+                $deltaVals = $deltas | ForEach-Object { $_.Delta }
+                $avg = ($deltaVals | Measure-Object -Average).Average
+                $min = ($deltaVals | Measure-Object -Minimum).Minimum
+                if ($avg -gt 0 -and $min -gt 0 -and $min / $avg -lt 0.1) {
+                    $erratic = $true
+                    Write-Warn "  PTS deltas are erratic (min/avg=$([math]::Round($min/$avg*100, 1))%) — will use CFR rebuild"
+                }
             }
+        } else {
+            Write-Info "  Strong compression (audio is the reference timeline) — using setts stretch"
         }
 
         if ($erratic) {
@@ -318,7 +330,12 @@ function Fix-Part2Pts {
 
         } else {
             Write-Step "Applying PTS stretch + offset..." Green
-            ffmpeg -i $InputFile -c copy -bsf:v "setts=pts=PTS*$ratio" -map 0 -output_ts_offset $PtsOffset -video_track_timescale 90000 -y $OutputFile 2>&1 | ForEach-Object {
+            # Stretch BOTH PTS and DTS — setts=pts only leaves DTS at the old
+            # (compressed) scale, and a later MKV remux rebuilds the timeline
+            # from DTS, truncating the video.
+            # NOTE: ${ratio} braces required — `$ratio:dts` is parsed as a
+            # drive-qualified variable and becomes null!
+            ffmpeg -i $InputFile -c copy -bsf:v "setts=pts=PTS*${ratio}:dts=DTS*${ratio}" -map 0 -output_ts_offset $PtsOffset -video_track_timescale 90000 -y $OutputFile 2>&1 | ForEach-Object {
                 if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
                     Write-Progress -Activity "Stretching PTS" -Status $matches[1]
                 }
@@ -329,7 +346,7 @@ function Fix-Part2Pts {
         $ratio = $aDur / $vDur
         Write-Warn "  Video PTS is longer than audio: ratio=$([math]::Round($ratio, 4))"
         Write-Step "Applying PTS compress + offset..." Green
-        ffmpeg -i $InputFile -c copy -bsf:v "setts=pts=PTS*$ratio" -map 0 -output_ts_offset $PtsOffset -video_track_timescale 90000 -y $OutputFile 2>&1 | ForEach-Object {
+        ffmpeg -i $InputFile -c copy -bsf:v "setts=pts=PTS*${ratio}:dts=DTS*${ratio}" -map 0 -output_ts_offset $PtsOffset -video_track_timescale 90000 -y $OutputFile 2>&1 | ForEach-Object {
             if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
                 Write-Progress -Activity "Compressing PTS" -Status $matches[1]
             }
@@ -347,6 +364,10 @@ function Fix-Part2Pts {
     }
 
     if (Test-Path $OutputFile) {
+        # NOTE: do NOT remux here. setts+output_ts_offset gives the intermediate
+        # part2 the concat offset it needs; an MKV round-trip zeroes the PTS and
+        # would truncate part2's video during concat. Metadata regeneration is
+        # done on the FINAL output only.
         Write-Ok "  Fixed Part2: $OutputFile"
         return Get-VideoInfo $OutputFile
     }
@@ -419,6 +440,22 @@ function Fix-Part2PtsMulti {
     param([string]$InputFile, [string]$OutputFile, [double]$PtsOffset)
 
     $tmpDir = $script:WorkDir
+
+    # KEY GUARD: if audio duration is much longer than video PTS, the audio stream
+    # is the healthy reference timeline (video PTS compressed). Splitting part2 by
+    # video PTS would truncate the healthy audio — always use single-ratio stretch.
+    $gInfo = Get-VideoInfo $InputFile
+    $gV = $gInfo.Video
+    $gA = $gInfo.Audio
+    if ($gV -and $gA) {
+        $gVDur = [double]$gV.duration
+        $gADur = [double]$gA.duration
+        if ($gADur -gt $gVDur * 1.5) {
+            Write-Warn "  Audio is the reference timeline (audio=$([math]::Round($gADur,1))s vs video PTS=$([math]::Round($gVDur,1))s)"
+            Write-Warn "  Using single-ratio stretch — splitting by video PTS would truncate the healthy audio"
+            return Fix-Part2Pts $InputFile $OutputFile $PtsOffset
+        }
+    }
 
     # Analyze compression windows
     $windows = Analyze-CompressionWindows $InputFile -Windows 20
@@ -526,11 +563,14 @@ function Concat-Parts {
     $tmpDir = $script:WorkDir
     $concatFile = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).txt"
 
-    # Use ffmpeg concat demuxer
-    @"
+    # Use ffmpeg concat demuxer. Write UTF-8 WITHOUT BOM — ffmpeg's concat demuxer
+    # rejects a leading BOM as an unknown keyword. UTF-8 (not ASCII) so Chinese
+    # filenames survive.
+    $listContent = @"
 file '$($Part1 -replace "'","'\\''")'
 file '$($Part2 -replace "'","'\\''")'
-"@ | Set-Content -Path $concatFile -Encoding ASCII
+"@
+    [System.IO.File]::WriteAllText($concatFile, $listContent, (New-Object System.Text.UTF8Encoding($false)))
 
     ffmpeg -f concat -safe 0 -i $concatFile -c copy -map 0 -movflags +faststart -y $OutputFile 2>&1 | ForEach-Object {
         if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
@@ -541,6 +581,9 @@ file '$($Part2 -replace "'","'\\''")'
 
     Remove-Item $concatFile -Force -ErrorAction SilentlyContinue
 
+    # NOTE: no remux needed. setts stretches BOTH pts and dts, so the MP4 muxer
+    # writes a correct stts table directly — an MKV round-trip is unnecessary
+    # and doubles the disk requirement.
     return (Test-Path $OutputFile)
 }
 
@@ -636,6 +679,12 @@ if ($actualSplitTime -le 0 -or $actualSplitTime -ge $inVDur) {
 $inDir = Split-Path $InputFile -Parent
 $base = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
 $outDir = if ($OutputDir) { $OutputDir } else { $inDir }
+
+# Ensure output dir exists
+if (-not (Test-Path $outDir)) {
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    Write-Step "Created output dir: $outDir" DarkGray
+}
 
 # Verify both work dir and output dir have enough space
 Test-DiskSpace $script:WorkDir $script:RequiredGB "work dir ($script:WorkDir)" | Out-Null
