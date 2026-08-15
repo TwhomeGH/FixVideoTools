@@ -77,6 +77,75 @@ PTS Spike 修復工具。偵測 PTS 異常跳變點（如 fps 從 60 突然跳�
 
 ---
 
+### `analyze-pts-regions.ps1`
+FPS 基準分析器（唯讀）。掃描 PTS 時間軸，偵測檔案內不同的 fps 基準（VFR），輸出完整逐窗 fps 報告與分割建議。不產生任何輸出檔。
+
+```
+.\analyze-pts-regions.ps1 -InputFile <路徑> [-WindowSec 30] [-ReportWindowSec 60] [-Threshold 0.15] [-MinHold 3] [-MinSegmentSec 60] [-MaxFrames 200000] [-ShowAll]
+```
+
+| 參數 | 說明 |
+|------|------|
+| `-InputFile` | 目標檔案（必填） |
+| `-WindowSec` | 基準偵測用的窗寬（秒） |
+| `-ReportWindowSec` | 報告表列間距（秒） |
+| `-Threshold` | fps 偏離多少判定為轉折（相對值） |
+| `-MinHold` | 連續多少個偏離窗才算確認轉折 |
+| `-MinSegmentSec` | 短於此秒數的段會被合併 |
+| `-MaxFrames` | PTS 採樣上限（0 = 全部） |
+| `-ShowAll` | 印出每一列報告（預設壓縮到 ~60 列） |
+
+**輸出：** 檔案總覽（含壞標頭警示）、逐窗 FPS 表、fps 基準摘要、以及該用哪個工具修復的結論。
+
+---
+
+### `split-pts-regions.ps1`
+VFR 多段拆分工具。自動偵測影片內多個 fps 基準（如 60fps → 33fps → 30fps），在轉折點拆成 `_part1.mp4` / `_part2.mp4` / `_part3.mp4`…，每段單趟輸出、保留原始 PTS、A/V 完全對齊。
+
+```
+.\split-pts-regions.ps1 -InputFile <路徑> [-OutputDir <目錄>] [-NoEncode] [-Encoder auto|nvenc|amf|libx264] [-Crf 28] [-Preset <預設>] [-CfrFps 0] [-Concat] [-ReportOnly] [-Force] [-KeepTemp]
+```
+
+| 參數 | 說明 |
+|------|------|
+| `-InputFile` | 原始檔案（必填） |
+| `-OutputDir` | 輸出目錄（預設：與輸入同目錄） |
+| `-NoEncode` | 改為無損 stream-copy（檔案大，需大量磁碟空間） |
+| `-Encoder` | 編碼器：`auto`（自動偵測 nvenc→amf→qsv→libx264）、`nvenc`、`amf`、`libx264` |
+| `-Crf` | 品質（0-51，越低越好；NVENC `-cq` / AMF `-qp` / x264 `-crf`） |
+| `-Preset` | 編碼器預設（如 nvenc 的 `p5`、x264 的 `medium`） |
+| `-CfrFps` | 若 >0，強制統一幀率（會破壞 VFR，僅限真正的 CFR 段） |
+| `-Concat` | 拆完後對齊時間軸並合併成 `_fixed.mp4` |
+| `-ReportOnly` | 只印分析報告，不切割 |
+| `-Force` | 覆蓋已存在的輸出 |
+| `-KeepTemp` | 保留 `_tmp\` 暫存檔 |
+
+**運作流程：**
+1. 完整 PTS dump → 每 30 秒窗計算 fps
+2. hysteresis 演算法分群成 N 個 fps 基準（可超過 2 段）
+3. 輸出逐窗 FPS 分析報告 + 基準摘要表
+4. 每個轉折點用單趟 `-copyts` 切割（video+audio 一次輸出，不產生 5GB 級暫存）
+5. 每段驗證 A/V 同步，最後列出完整對照表
+
+**範例：**
+```powershell
+# 轉碼（NVENC 自動偵測）拆成多段，預設保留 VFR
+.\split-pts-regions.ps1 "input.mp4" -OutputDir ".\parts"
+
+# 無損 stream-copy（不轉碼）
+.\split-pts-regions.ps1 "input.mp4" -NoEncode -OutputDir ".\parts"
+
+# 只分析不切割
+.\split-pts-regions.ps1 "input.mp4" -ReportOnly
+
+# AMD 硬體編碼 + 合併
+.\split-pts-regions.ps1 "input.mp4" -Encoder amf -Crf 28 -Concat
+```
+
+**注意：** 若來源已重度壓縮（低碼率），轉碼反而可能比原檔大。工具會顯示來源碼率警示，此時請提高 `-Crf` 或改用 `-NoEncode`。暫存目錄固定在腳本旁的 `_tmp\`，不會塞爆 C 槽。
+
+---
+
 ### `hybrid-cut.ps1`
 精確切割工具。分別以相同原始 PTS 切割 video 與 audio 再合併，確保 A/V 起始點完全一致。
 

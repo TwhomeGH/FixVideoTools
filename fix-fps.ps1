@@ -78,6 +78,11 @@ Write-Host "  FPS Metadata Fix Tool v3.0" -ForegroundColor Cyan
 Write-Host "  Detects and fixes: r_frame_rate corruption + PTS compression" -ForegroundColor Cyan
 Write-Host ("=" * 70) -ForegroundColor Cyan
 
+$script:WorkDir = Join-Path $PSScriptRoot "_tmp"
+if (-not (Test-Path $script:WorkDir)) {
+    New-Item -ItemType Directory -Path $script:WorkDir -Force | Out-Null
+}
+
 if (-not (Test-Path -LiteralPath $InputFile)) {
     Write-Host "ERROR: Input file not found: $InputFile" -ForegroundColor Red
     exit 1
@@ -186,7 +191,7 @@ if ($Strategy -eq "genpts") {
 }
 elseif ($Strategy -eq "mkv") {
     Write-Step "Strategy: mkv (MKV intermediate strip)" Green
-    $tmpMkv = Join-Path ([System.IO.Path]::GetTempPath()) "fixfps_$([System.IO.Path]::GetRandomFileName()).mkv"
+    $tmpMkv = Join-Path $script:WorkDir "fixfps_$([System.IO.Path]::GetRandomFileName()).mkv"
     Write-Step "  Step 1: MP4 -> MKV" DarkYellow
     ffmpeg -i $InputFile -c copy -map 0 -y $tmpMkv 2>&1 | ForEach-Object {
         if ($_ -match "time=(\d+:\d+:\d+\.\d+)") { Write-Progress -Activity "Step 1/2: MP4->MKV" -Status $matches[1] }
@@ -208,7 +213,7 @@ elseif ($Strategy -eq "cfr" -or $ptsCorrupted -or $fpsMismatch) {
     } else {
         Write-Step "Strategy: CFR (constant frame rate rebuild, discards corrupted PTS)" Green
     }
-    $tmpDir = [System.IO.Path]::GetTempPath()
+    $tmpDir = $script:WorkDir
     $tmpVideo = Join-Path $tmpDir "fixfps_$([System.IO.Path]::GetRandomFileName()).h264"
     $tmpAudio = Join-Path $tmpDir "fixfps_$([System.IO.Path]::GetRandomFileName()).aac"
 
@@ -229,7 +234,7 @@ elseif ($Strategy -eq "cfr" -or $ptsCorrupted -or $fpsMismatch) {
 else {
     # auto / raw strategy: extract raw streams + remux
     # If PTS is compressed, also apply setts stretch before extraction
-    $tmpDir = [System.IO.Path]::GetTempPath()
+    $tmpDir = $script:WorkDir
     $srcForExtract = $InputFile
 
     # Phase 1: PTS stretch (if needed)
