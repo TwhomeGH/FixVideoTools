@@ -47,6 +47,25 @@ function Test-FFmpeg {
     Write-Step "ffmpeg: $ver" DarkCyan
 }
 
+function Test-DiskSpace {
+    param(
+        [string]$Path,
+        [double]$RequiredGB,
+        [string]$Label = "disk"
+    )
+    try {
+        $drive = New-Object System.IO.DriveInfo($Path.Substring(0, 3))
+        $freeGB = $drive.AvailableFreeSpace / 1GB
+        if ($freeGB -lt $RequiredGB) {
+            throw "Insufficient disk space on ${Label}: only $([math]::Round($freeGB, 2)) GB free, need at least $([math]::Round($RequiredGB, 2)) GB"
+        }
+        Write-Info "  $Label free space: $([math]::Round($freeGB, 2)) GB"
+        return $freeGB
+    } catch {
+        throw "Cannot check disk space for $Path : $_"
+    }
+}
+
 function Get-VideoInfo {
     param([string]$File)
     $json = ffprobe -v quiet -print_format json -show_format -show_streams $File 2>$null | ConvertFrom-Json
@@ -135,11 +154,11 @@ function Cut-Part1 {
     param([string]$File, [double]$Duration, [string]$OutPath)
 
     Write-Step "Cutting Part1 (0 ~ $([math]::Round($Duration, 0))s = $($(Format-Time $Duration)))" Green
-    $tempPath = [System.IO.Path]::GetTempPath()
+    $tempPath = $script:WorkDir
     $tempPart1 = Join-Path $tempPath "ptsspike_$([System.IO.Path]::GetRandomFileName()).mp4"
 
     # Use audio-first stream copy for accurate cut
-    ffmpeg -copyts -i $File -map 0:a -map 0:v -c copy -to $Duration -y $tempPart1 2>&1 | ForEach-Object {
+    ffmpeg -copyts -i $File -map 0:a -map 0:v -c copy -to $Duration -avoid_negative_ts make_zero -y $tempPart1 2>&1 | ForEach-Object {
         if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
             Write-Progress -Activity "Cutting Part1" -Status $matches[1]
         }
@@ -152,7 +171,7 @@ function Cut-Part1 {
     }
 
     # Remux to restore video-first stream order
-    ffmpeg -i $tempPart1 -map 0:1 -map 0:0 -c copy -y $OutPath 2>&1 | ForEach-Object {
+    ffmpeg -i $tempPart1 -map 0:1 -map 0:0 -c copy -avoid_negative_ts make_zero -y $OutPath 2>&1 | ForEach-Object {
         if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
             Write-Progress -Activity "Remuxing Part1" -Status $matches[1]
         }
@@ -180,7 +199,7 @@ function Cut-Part2 {
 
     Write-Step "Cutting Part2 ($(Format-Time $StartTime) ~ end)" Green
 
-    $tmpDir = [System.IO.Path]::GetTempPath()
+    $tmpDir = $script:WorkDir
     $seekBack = [math]::Max(30, $StartTime * 0.01)
 
     # Step 1/3: Cut video stream at StartTime
@@ -199,10 +218,13 @@ function Cut-Part2 {
     if (-not $vFirstOrigPts) { Write-Err "ERROR: Cannot read video PTS"; Remove-Item $tempVideo -Force; return $null }
     Write-Info ("  First video frame at original PTS {0:f4}s" -f $vFirstOrigPts)
 
-    # Step 2/3: Cut audio stream at the SAME original PTS as first video frame
+    # Step 2/3: Cut audio stream from the original PTS StartTime.
+    # NOTE: do NOT use $vFirstOrigPts — the MP4 muxer zeroed the temp video's PTS,
+    # so that value is meaningless. The audio must start at StartTime so Part2 keeps
+    # the full-length audio stream (needed to detect video-PTS-only compression).
     $tempAudio = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).mp4"
-    Write-Info ("  Step 2/3: Cutting audio at same PTS {0:f4}s..." -f $vFirstOrigPts)
-    ffmpeg -ss ($StartTime - $seekBack) -copyts -i $File -map 0:a -c copy -ss $vFirstOrigPts -y $tempAudio 2>&1 | ForEach-Object {
+    Write-Info ("  Step 2/3: Cutting audio at PTS {0:f4}s..." -f $StartTime)
+    ffmpeg -ss ($StartTime - $seekBack) -copyts -i $File -map 0:a -c copy -ss $StartTime -y $tempAudio 2>&1 | ForEach-Object {
         if ($_ -match "time=(\d+:\d+:\d+\.\d+)") {
             Write-Progress -Activity "Cutting audio" -Status $matches[1]
         }
@@ -275,7 +297,7 @@ function Fix-Part2Pts {
         if ($erratic) {
             $targetFps = [math]::Round($frames / $aDur, 4)
 
-            $tmpDir = [System.IO.Path]::GetTempPath()
+            $tmpDir = $script:WorkDir
             $tmpVideo = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).h264"
             Write-Step "  Step 1/2: Extracting raw H.264..." DarkYellow
             ffmpeg -i $InputFile -c:v copy -bsf:v h264_mp4toannexb -f h264 -y $tmpVideo 2>&1 | ForEach-Object {
@@ -396,7 +418,7 @@ function Find-CompressionBreaks {
 function Fix-Part2PtsMulti {
     param([string]$InputFile, [string]$OutputFile, [double]$PtsOffset)
 
-    $tmpDir = [System.IO.Path]::GetTempPath()
+    $tmpDir = $script:WorkDir
 
     # Analyze compression windows
     $windows = Analyze-CompressionWindows $InputFile -Windows 20
@@ -443,6 +465,8 @@ function Fix-Part2PtsMulti {
 
         $rawSeg = Join-Path $tmpDir "ptsspike_ms_$([System.IO.Path]::GetRandomFileName()).mp4"
         $fixedSeg = Join-Path $tmpDir "ptsspike_mf_$([System.IO.Path]::GetRandomFileName()).mp4"
+
+        Test-DiskSpace $tmpDir $script:RequiredGB "work dir (multi-segment)" | Out-Null
 
         # Cut segment (stream copy, A/V together since part2_raw is already aligned)
         Write-Info "    Segment $(($i+1)): PTS $([math]::Round($segStart,1))s ~ $([math]::Round($segEnd,1))s"
@@ -499,7 +523,7 @@ function Concat-Parts {
 
     Write-Step "Concatenating Part1 + Fixed Part2..." Green
 
-    $tmpDir = [System.IO.Path]::GetTempPath()
+    $tmpDir = $script:WorkDir
     $concatFile = Join-Path $tmpDir "ptsspike_$([System.IO.Path]::GetRandomFileName()).txt"
 
     # Use ffmpeg concat demuxer
@@ -537,6 +561,18 @@ if (-not (Test-Path -LiteralPath $InputFile)) {
 }
 
 Test-FFmpeg
+
+# ---- Work dir (local, avoids C: temp space issues) ----
+$script:WorkDir = Join-Path $PSScriptRoot "_tmp"
+if (-not (Test-Path $script:WorkDir)) {
+    New-Item -ItemType Directory -Path $script:WorkDir -Force | Out-Null
+}
+
+# ---- Minimum free space guard (stop early rather than filling the disk) ----
+$script:MinFreeGB = 1.0
+$inSizeGB = (Get-Item -LiteralPath $InputFile).Length / 1GB
+$script:RequiredGB = [math]::Max($script:MinFreeGB, [math]::Round($inSizeGB * 2.5, 2))
+Write-Step "Disk guard: need >= $($script:RequiredGB) GB free (input=$([math]::Round($inSizeGB, 2)) GB)" DarkGray
 
 # Analyze input
 Write-Step "Analyzing: $InputFile" Yellow
@@ -601,6 +637,10 @@ $inDir = Split-Path $InputFile -Parent
 $base = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
 $outDir = if ($OutputDir) { $OutputDir } else { $inDir }
 
+# Verify both work dir and output dir have enough space
+Test-DiskSpace $script:WorkDir $script:RequiredGB "work dir ($script:WorkDir)" | Out-Null
+Test-DiskSpace $outDir $script:RequiredGB "output dir ($outDir)" | Out-Null
+
 if ($NoConcat) {
     $part1Output = Join-Path $outDir "${base}_part1.mp4"
     $part2FixedOutput = Join-Path $outDir "${base}_part2_fixed.mp4"
@@ -624,7 +664,7 @@ if ($NoConcat) {
 }
 
 # Prepare paths
-$tmpDir = [System.IO.Path]::GetTempPath()
+$tmpDir = $script:WorkDir
 $part2RawPath = Join-Path $tmpDir "ptsspike_part2_$([System.IO.Path]::GetRandomFileName()).mp4"
 
 if ($NoConcat) {
@@ -640,6 +680,7 @@ try {
     Write-Host ""
     Write-Host ("-" * 60)
     Write-Step "PHASE 1: Cut Part1 (0 ~ $([math]::Round($actualSplitTime, 0))s)" Yellow
+    Test-DiskSpace $script:WorkDir $script:RequiredGB "work dir" | Out-Null
     $part1Info = Cut-Part1 $InputFile $actualSplitTime $part1Path
     if (-not $part1Info) { throw "Part1 cut failed" }
 
@@ -647,6 +688,7 @@ try {
     Write-Host ""
     Write-Host ("-" * 60)
     Write-Step "PHASE 2: Cut Part2 (remainder)" Yellow
+    Test-DiskSpace $script:WorkDir $script:RequiredGB "work dir" | Out-Null
     $part2Info = Cut-Part2 $InputFile $actualSplitTime $part2RawPath
     if (-not $part2Info) { throw "Part2 cut failed" }
 
@@ -654,6 +696,7 @@ try {
     Write-Host ""
     Write-Host ("-" * 60)
     Write-Step "PHASE 3: Fix Part2 PTS" Yellow
+    Test-DiskSpace $script:WorkDir $script:RequiredGB "work dir" | Out-Null
     $ptsOffset = if ($NoConcat) { 0 } else { [double]$part1Info.Video.duration }
     $fixedInfo = Fix-Part2PtsMulti $part2RawPath $part2FixedPath $ptsOffset
     if (-not $fixedInfo) { throw "Part2 fix failed" }
@@ -692,6 +735,7 @@ try {
         Write-Host ""
         Write-Host ("-" * 60)
         Write-Step "PHASE 4: Concatenate" Yellow
+        Test-DiskSpace $outDir $script:RequiredGB "output dir" | Out-Null
         $ok = Concat-Parts $part1Path $part2FixedPath $OutputFile
         if (-not $ok) { throw "Concatenation failed" }
 
