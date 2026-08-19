@@ -10,7 +10,8 @@ param(
     [switch]$Force,
     [switch]$KeepTemp,
     [switch]$SkipVerify,
-    [switch]$NoConcat
+    [switch]$NoConcat,
+    [switch]$UniformCfr
 )
 
 function Write-Step {
@@ -460,7 +461,10 @@ function Fix-Part2Pts {
             # region (frame-timing-change). A single uniform CFR would speed up
             # the tail content (e.g. 30fps tail forced to 50fps → 1.69x, jerky
             # playback, A/V drift). Splitting preserves each region's true fps.
-            $break = Detect-FrameTimingBreak $InputFile
+            # NOTE: -UniformCfr forces a single uniform CFR (audio as the only
+            # reference) — the segmented assumption may be wrong for files with
+            # heavy PTS labeling noise.
+            $break = if ($script:UniformCfr) { $null } else { Detect-FrameTimingBreak $InputFile }
             if ($break) {
                 Write-Warn "  Frame-timing change detected — using segmented CFR"
                 $segInfo = Fix-Part2Segmented $InputFile $OutputFile $PtsOffset $break
@@ -786,6 +790,7 @@ if (-not (Test-Path $script:WorkDir)) {
 
 # ---- Minimum free space guard (stop early rather than filling the disk) ----
 $script:MinFreeGB = 1.0
+$script:UniformCfr = $UniformCfr
 $inSizeGB = (Get-Item -LiteralPath $InputFile).Length / 1GB
 $script:RequiredGB = [math]::Max($script:MinFreeGB, [math]::Round($inSizeGB * 2.5, 2))
 Write-Step "Disk guard: need >= $($script:RequiredGB) GB free (input=$([math]::Round($inSizeGB, 2)) GB)" DarkGray
